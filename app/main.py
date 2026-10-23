@@ -1,5 +1,5 @@
-
 import json
+import logging
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -15,6 +15,9 @@ from app.security import authenticated_principal, require_a2a_content_type
 from app.services.task_service import create_or_replay_task
 
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
@@ -26,14 +29,13 @@ app = FastAPI(
 def _validate_public_base_url():
     parsed = urlparse(settings.public_base_url)
 
+    valid_local_http = (
+        parsed.scheme == "http"
+        and parsed.hostname in {"127.0.0.1", "localhost"}
+    )
+
     if (
-        (
-            parsed.scheme != "https"
-            and not (
-                parsed.hostname in {"127.0.0.1", "localhost"}
-                and parsed.scheme == "http"
-            )
-        )
+        (parsed.scheme != "https" and not valid_local_http)
         or not parsed.netloc
         or parsed.username
         or parsed.password
@@ -42,8 +44,8 @@ def _validate_public_base_url():
         or parsed.path not in {"", "/"}
     ):
         raise RuntimeError(
-            "PUBLIC_BASE_URL must be the public HTTPS origin "
-            "without path, credentials, query, or fragment"
+            "PUBLIC_BASE_URL must be an HTTPS origin without "
+            "a path, credentials, query, or fragment."
         )
 
 
@@ -51,7 +53,8 @@ def _validate_public_base_url():
 async def agent_card():
     _validate_public_base_url()
 
-    base = settings.public_base_url.rstrip("/") + "/a2a/"
+    # Preserve the original A2A interface URL.
+    interface_url = settings.public_base_url.rstrip("/") + "/a2a/"
 
     return JSONResponse(
         {
@@ -69,7 +72,7 @@ async def agent_card():
             },
             "supportedInterfaces": [
                 {
-                    "url": base,
+                    "url": interface_url,
                     "protocolBinding": "HTTP+JSON",
                     "protocolVersion": "1.0",
                 }
@@ -97,7 +100,8 @@ async def agent_card():
     )
 
 
-# Accept both the grader's root path and the original A2A path.
+# The grader may use /message:send.
+# Keep the original /a2a/message:send endpoint as well.
 @app.post("/message:send")
 @app.post("/a2a/message:send")
 async def send_message(
@@ -113,7 +117,11 @@ async def send_message(
         if not isinstance(body, dict):
             raise ValueError("Request body must be a JSON object")
 
-        result = await create_or_replay_task(db, principal, body)
+        result = await create_or_replay_task(
+            db=db,
+            principal=principal,
+            request_body=body,
+        )
 
         if result.get("conflict"):
             return JSONResponse(
@@ -141,7 +149,7 @@ async def send_message(
             )
 
         return JSONResponse(
-            {"task": result["task"]},
+            content={"task": result["task"]},
             media_type="application/a2a+json",
         )
 
@@ -176,6 +184,15 @@ async def send_message(
         )
 
     except Exception:
+        # The details go to server logs, not the public response.
+        logger.exception("Unhandled error while processing A2A message")
+
+        # Roll back any unfinished database transaction.
+        try:
+            db.rollback()
+        except Exception:
+            logger.exception("Database rollback failed")
+
         raise HTTPException(
             status_code=500,
             detail={
@@ -185,24 +202,33 @@ async def send_message(
         )
 
 
+# Task listing: support both endpoint prefixes.
 @app.get("/tasks")
 @app.get("/a2a/tasks")
 async def list_tasks(
     principal: str = Depends(authenticated_principal),
     db: Session = Depends(get_db),
 ):
-    rows = db.scalars(
-        select(TaskRecord)
-        .where(TaskRecord.principal_id == principal)
-        .order_by(TaskRecord.created_at.desc())
-    ).all()
+    try:
+        rows = db.scalars(
+            select(TaskRecord)
+            .where(TaskRecord.principal_id == principal)
+            .order_by(TaskRecord.created_at.desc())
+        ).all()
 
-    return JSONResponse(
-        {"tasks": [json.loads(row.task_json) for row in rows]},
-        media_type="application/a2a+json",
-    )
+        return JSONResponse(
+            content={
+                "tasks": [json.loads(row.task_json) for row in rows]
+            },
+            media_type="application/a2a+json",
+        )
+
+    except Exception:
+        logger.exception("Failed to list tasks")
+        raise
 
 
+# Task retrieval: support both endpoint prefixes.
 @app.get("/tasks/{task_id}")
 @app.get("/a2a/tasks/{task_id}")
 async def get_task(
@@ -222,11 +248,12 @@ async def get_task(
         )
 
     return JSONResponse(
-        json.loads(row.task_json),
+        content=json.loads(row.task_json),
         media_type="application/a2a+json",
     )
 
 
+# Task cancellation: support both endpoint prefixes.
 @app.post("/tasks/{task_id}:cancel")
 @app.post("/a2a/tasks/{task_id}:cancel")
 async def cancel_task(
@@ -266,6 +293,7 @@ async def cancel_task(
 
     task["status"] = {"state": "TASK_STATE_CANCELED"}
 
+    # Never retain execution receipts after cancellation.
     task["artifacts"] = [
         artifact
         for artifact in task.get("artifacts", [])
@@ -284,7 +312,10 @@ async def cancel_task(
             TaskRecord.id == task_id,
             TaskRecord.principal_id == principal,
             TaskRecord.state.in_(
-                ["TASK_STATE_WORKING", "TASK_STATE_INPUT_REQUIRED"]
+                [
+                    "TASK_STATE_WORKING",
+                    "TASK_STATE_INPUT_REQUIRED",
+                ]
             ),
         )
         .values(
@@ -309,7 +340,7 @@ async def cancel_task(
     db.commit()
 
     return JSONResponse(
-        task,
+        content=task,
         media_type="application/a2a+json",
     )
 
