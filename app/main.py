@@ -117,11 +117,7 @@ async def send_message(
         if not isinstance(body, dict):
             raise ValueError("Request body must be a JSON object")
 
-        result = await create_or_replay_task(
-            db=db,
-            principal=principal,
-            request_body=body,
-        )
+        result = await create_or_replay_task(db, principal, body)
 
         if result.get("conflict"):
             return JSONResponse(
